@@ -21,11 +21,6 @@ plt.rcParams['font.family'] = ['MS Gothic', 'DejaVu Sans']
 # 出力ディレクトリ
 os.makedirs('results/earthquakes', exist_ok=True)
 
-print("=" * 60)
-print("南海トラフ地震シミュレーション（2D版）")
-print("Nankai Trough Earthquake Simulation")
-print("=" * 60)
-print()
 
 # ==============================================================================
 # 領域定義（セグメント）
@@ -79,12 +74,18 @@ a = 0.005
 # プレート速度
 V_pl_base = 5.5e-2 / (365.25 * 24 * 3600)  # 5.5 cm/year → m/s
 
-# グリッドサイズ
-N_X = 40  # 走向方向
-N_Y = 8   # ディップ方向
+# グリッドサイズ（コマンドラインで設定可能）
+N_X = 40  # 走向方向（デフォルト）
+N_Y = 8   # ディップ方向（デフォルト）
 N_CELLS = N_X * N_Y
 
-print(f"グリッドサイズ: {N_X} x {N_Y} = {N_CELLS} セル")
+def set_grid_size(nx: int, ny: int):
+    """グリッドサイズを設定"""
+    global N_X, N_Y, N_CELLS
+    N_X = nx
+    N_Y = ny
+    N_CELLS = N_X * N_Y
+    print(f"グリッドサイズ: {N_X} x {N_Y} = {N_CELLS} セル")
 
 # ==============================================================================
 # セルごとのパラメータ設定
@@ -146,34 +147,141 @@ def setup_parameters():
     return b, sigma, L, V_pl, cell_x, cell_y
 
 
-# ==============================================================================
-# 簡易的な相互作用カーネル
-# ==============================================================================
-def create_interaction_kernel():
-    """セル間の応力相互作用カーネルを作成"""
-    K = np.zeros((N_CELLS, N_CELLS))
+def setup_parameters_from_polygon(polygon_json_path: str):
+    """
+    polygon_data.json を使用して空間的に不均質なパラメータを設定
+    
+    Args:
+        polygon_json_path: polygon_data.json のパス
+    
+    Returns:
+        b, sigma, L, V_pl, cell_x, cell_y (各N_CELLS配列)
+    """
+    import json
+    from matplotlib.path import Path as MplPath
+    
+    # デフォルトパラメータで初期化
+    b = np.full(N_CELLS, 0.008)
+    sigma = np.full(N_CELLS, 30.0e6)
+    L = np.full(N_CELLS, 0.4)
+    V_pl = np.full(N_CELLS, V_pl_base)
+    
+    # セル座標（実際の経度・緯度に変換）
+    cell_x = np.zeros(N_CELLS)
+    cell_y = np.zeros(N_CELLS)
+    cell_lon = np.zeros(N_CELLS)
+    cell_lat = np.zeros(N_CELLS)
+    
+    # 経度・緯度範囲（南海トラフ全域）
+    lon_min, lon_max = 131.0, 139.0
+    lat_min, lat_max = 30.5, 35.5
     
     for i in range(N_CELLS):
-        ix_i = i % N_X
-        iy_i = i // N_X
+        ix = i % N_X
+        iy = i // N_X
+        cell_x[i] = (ix + 0.5) / N_X
+        cell_y[i] = (iy + 0.5) / N_Y
+        cell_lon[i] = lon_min + cell_x[i] * (lon_max - lon_min)
+        cell_lat[i] = lat_min + cell_y[i] * (lat_max - lat_min)
+    
+    # polygon_data.json を読み込み
+    try:
+        with open(polygon_json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
         
-        for j in range(N_CELLS):
-            ix_j = j % N_X
-            iy_j = j // N_X
+        locked_zone = [(p['lon'], p['lat']) for p in data.get('locked_zone', [])]
+        unlocked_zone = [(p['lon'], p['lat']) for p in data.get('unlocked_zone', [])]
+        
+        print(f"polygon_data.json を読み込みました: {polygon_json_path}")
+        print(f"  固着域: {len(locked_zone)} 点")
+        print(f"  非固着域: {len(unlocked_zone)} 点")
+        
+        # ポリゴンパスを作成
+        locked_coords = np.array(locked_zone)
+        unlocked_coords = np.array(unlocked_zone)
+        
+        locked_path = MplPath(locked_coords) if len(locked_coords) > 2 else None
+        unlocked_path = MplPath(unlocked_coords) if len(unlocked_coords) > 2 else None
+        
+        # 各セルがどのゾーンに属するかを判定
+        for i in range(N_CELLS):
+            point = np.array([[cell_lon[i], cell_lat[i]]])
+            in_locked = locked_path.contains_points(point)[0] if locked_path else False
+            in_unlocked = unlocked_path.contains_points(point)[0] if unlocked_path else False
+            
+            depth_factor = cell_y[i]  # 0=浅い, 1=深い
+            
+            if in_locked:
+                # 固着域：地震発生しやすいパラメータ
+                b[i] = 0.008  # velocity weakening
+                sigma[i] = 30.0e6 + depth_factor * 10.0e6
+                L[i] = 0.3 + depth_factor * 0.2
+                V_pl[i] = V_pl_base * (1.0 - 0.3 * cell_x[i])
+            elif in_unlocked:
+                # 非固着域：安定すべり（LSSE発生可能）
+                b[i] = 0.003  # velocity strengthening寄り
+                sigma[i] = 20.0e6
+                L[i] = 0.08
+                V_pl[i] = V_pl_base * (1.0 - 0.3 * cell_x[i])
+            else:
+                # どちらにも属さない：デフォルト値を維持
+                # 深さに応じた調整
+                if depth_factor > 0.75:
+                    b[i] = 0.002
+                    L[i] = 0.1
+        
+        locked_count = sum(1 for i in range(N_CELLS) 
+                          if locked_path and locked_path.contains_points([[cell_lon[i], cell_lat[i]]])[0])
+        unlocked_count = sum(1 for i in range(N_CELLS)
+                            if unlocked_path and unlocked_path.contains_points([[cell_lon[i], cell_lat[i]]])[0])
+        print(f"  セル分類: 固着域={locked_count}, 非固着域={unlocked_count}")
+        
+    except FileNotFoundError:
+        print(f"警告: {polygon_json_path} が見つかりません。デフォルトパラメータを使用します。")
+    except Exception as e:
+        print(f"警告: {polygon_json_path} の読み込みエラー: {e}")
+    
+    return b, sigma, L, V_pl, cell_x, cell_y
+
+
+# ==============================================================================
+# 簡易的な相互作用カーネル（Numba最適化版）
+# ==============================================================================
+@njit(cache=True)
+def _compute_kernel_2d(n_cells: int, n_x: int, scale_factor: float, interaction_range: int) -> np.ndarray:
+    """Numba JIT最適化された2Dグリッドカーネル計算"""
+    K = np.zeros((n_cells, n_cells))
+    
+    for i in range(n_cells):
+        ix_i = i % n_x
+        iy_i = i // n_x
+        
+        for j in range(n_cells):
+            ix_j = j % n_x
+            iy_j = j // n_x
             
             if i == j:
-                # 自己スティフネス
-                K[i, j] = -1.0e6
+                K[i, j] = -1.0e6 * scale_factor
             else:
-                # 距離に応じた相互作用
                 dx = abs(ix_i - ix_j)
                 dy = abs(iy_i - iy_j)
-                dist = np.sqrt(dx**2 + dy**2)
+                dist = np.sqrt(float(dx**2 + dy**2))
                 
-                if dist < 5:
-                    K[i, j] = 0.3e6 / (dist + 0.5)**2
+                if dist < interaction_range:
+                    K[i, j] = 0.3e6 * scale_factor / (dist + 0.5)**2
     
     return K
+
+
+def create_interaction_kernel():
+    """セル間の応力相互作用カーネルを作成（高速版）"""
+    scale_factor = (40 * 8) / N_CELLS
+    interaction_range = max(3, int(5 * np.sqrt(scale_factor)))
+    
+    K = _compute_kernel_2d(N_CELLS, N_X, scale_factor, interaction_range)
+    
+    return K
+
 
 
 # ==============================================================================
@@ -350,12 +458,15 @@ def classify_regions(slip: np.ndarray, cell_x: np.ndarray, threshold: float = 1.
 # ==============================================================================
 # シミュレーション
 # ==============================================================================
-def run_simulation(t_years: float = 1000):
+def run_simulation(t_years: float = 1000, polygon_json_path: str = None):
     """2Dシミュレーションを実行"""
     print(f"\nシミュレーション期間: {t_years} 年")
     print("パラメータを設定中...")
     
-    b, sigma, L, V_pl, cell_x, cell_y = setup_parameters()
+    if polygon_json_path:
+        b, sigma, L, V_pl, cell_x, cell_y = setup_parameters_from_polygon(polygon_json_path)
+    else:
+        b, sigma, L, V_pl, cell_x, cell_y = setup_parameters()
     
     print("相互作用カーネルを計算中...")
     K = create_interaction_kernel()
@@ -389,30 +500,62 @@ def run_simulation(t_years: float = 1000):
     
     print("\nシミュレーション開始...")
     
+    # 高速化用の閾値
+    V_SEISMIC = 1e-3      # 地震判定閾値 [m/s]
+    V_PRESEISMIC = 1e-5   # 準備段階閾値 [m/s]
+    
     while t < t_end:
         # 速度計算
         V = solve_velocity(tau, theta, sigma, a, b, L, mu_0, V_0, rad_damp)
-        
-        # 適応タイムステップ
         V_max = np.max(V)
-        if V_max > 1e-3:
-            dt = min(0.1, np.min(L) / V_max / 10)
-        elif V_max > 1e-6:
-            dt = min(1e4, np.min(L) / V_max / 100)
-        else:
-            dt = min(1e7, 0.1 * np.min(theta))
+        L_min = np.min(L)
         
-        dt = max(dt, 0.01)
+        # ========================================
+        # 適応タイムステップ（1000年スパン対応）
+        # ========================================
+        if V_max > V_SEISMIC:
+            # 地震発生中：細かいステップ
+            dt = min(1.0, L_min / V_max / 10)
+            dt = max(dt, 0.01)  # 最低0.01秒
+        elif V_max > V_PRESEISMIC:
+            # 準備段階：中程度のステップ
+            dt = min(3600.0, L_min / V_max / 20)
+            dt = max(dt, 1.0)
+        else:
+            # 静穏期：大きなステップ（最大30日）
+            # θの変化率から安定なdtを推定
+            dtheta_est = state_evolution(V, theta, L, V_c)
+            max_dtheta_ratio = np.max(np.abs(dtheta_est) / np.maximum(theta, 1e-10))
+            if max_dtheta_ratio > 0:
+                dt_theta = 0.1 / max_dtheta_ratio  # θが10%以上変化しないように
+            else:
+                dt_theta = 86400.0 * 30
+            dt = min(86400.0 * 30, dt_theta)  # 最大30日
+            dt = max(dt, 60.0)  # 最低1分
+        
         if t + dt > t_end:
             dt = t_end - t
         
+        # ========================================
         # 状態更新
+        # ========================================
         dtheta = state_evolution(V, theta, L, V_c)
         theta = np.maximum(theta + dtheta * dt, 1e-10)
         
         # 応力更新（相互作用含む）
         dtau = K @ (V_pl - V)
-        tau = tau + dtau * dt
+        dtau_scaled = dtau * dt
+        
+        # 発散防止：静穏期は大きめ、地震時は厳しく
+        if V_max > V_SEISMIC:
+            max_dtau = 0.3 * np.min(sigma)
+        else:
+            max_dtau = 0.8 * np.min(sigma)
+        dtau_scaled = np.clip(dtau_scaled, -max_dtau, max_dtau)
+        tau = tau + dtau_scaled
+        
+        # 応力の下限
+        tau = np.maximum(tau, 0.1 * sigma * mu_0)
         
         # すべり更新
         slip = slip + V * dt
@@ -480,12 +623,18 @@ def run_simulation(t_years: float = 1000):
             t_hist.append(t)
             max_V_hist.append(V_max)
         
-        # 進捗表示
-        if time.time() - last_print > 5.0:
+        # 進捗表示（時間ベース、重複防止）
+        current_time = time.time()
+        current_t_years = t / (365.25 * 24 * 3600)
+        if current_time - last_print > 5.0:
             progress = t / t_end * 100
-            print(f"  進捗: {progress:.1f}%, t = {t/(365.25*24*3600):.1f} 年, "
-                  f"地震数 = {n_earthquakes}")
-            last_print = time.time()
+            # 前回と同じ進捗なら表示しない
+            if not hasattr(run_simulation, 'last_progress') or \
+               abs(progress - run_simulation.last_progress) > 0.1:
+                print(f"  進捗: {progress:.1f}%, t = {current_t_years:.1f} 年, "
+                      f"地震数 = {n_earthquakes}, dt = {dt:.2e} s")
+                run_simulation.last_progress = progress
+            last_print = current_time
     
     elapsed = time.time() - start_time
     
@@ -529,12 +678,38 @@ def run_simulation(t_years: float = 1000):
 if __name__ == '__main__':
     import argparse
     
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description='南海トラフ地震シミュレーション（2D版）',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+例:
+  python simulation_2d.py --years 1000
+  python simulation_2d.py --years 500 --nx 60 --ny 12
+  python simulation_2d.py --nx 80 --ny 16  (高解像度)
+  python simulation_2d.py --nx 20 --ny 4   (低解像度・高速)
+  python simulation_2d.py --polygon-data polygon_data.json --years 500
+        '''
+    )
     parser.add_argument('--years', type=float, default=1000, 
                         help='シミュレーション年数 (default: 1000)')
+    parser.add_argument('--nx', type=int, default=40, 
+                        help='走向方向のセル数 (default: 40)')
+    parser.add_argument('--ny', type=int, default=8, 
+                        help='ディップ方向のセル数 (default: 8)')
+    parser.add_argument('--polygon-data', type=str, default=None,
+                        help='polygon_data.json のパス（指定するとポリゴンデータを使用）')
     args = parser.parse_args()
     
-    earthquakes = run_simulation(t_years=args.years)
+    # グリッドサイズを設定
+    set_grid_size(args.nx, args.ny)
+    
+    print("=" * 60)
+    print("南海トラフ地震シミュレーション（2D版）")
+    print("Nankai Trough Earthquake Simulation")
+    print("=" * 60)
+    print()
+    
+    earthquakes = run_simulation(t_years=args.years, polygon_json_path=args.polygon_data)
     
     print()
     print("=" * 60)
@@ -543,3 +718,4 @@ if __name__ == '__main__':
     print(f"  年表: results/timeline.png")
     print(f"  速度履歴: results/velocity_history.png")
     print("=" * 60)
+
