@@ -18,6 +18,7 @@ from src.physics.stress_kernel import StressKernel
 from src.physics.friction import RateStateFriction
 from src.physics.equations import QuasiDynamicEquations, create_derivative_function
 from src.solver.runge_kutta import RK45Solver
+from src.output.animation import create_slip_animation
 
 @dataclass
 class Earthquake:
@@ -64,6 +65,11 @@ class RealisticSimulation:
             'last_print': time.time(),
             'start_time': time.time()
         }
+
+        # Animation
+        self.animate_earthquakes = False
+        self._anim_slip_history = []
+        self._anim_time_history = []
 
         # Callbacks
         self.on_earthquake: Optional[Callable[[Earthquake], None]] = None
@@ -119,11 +125,12 @@ class RealisticSimulation:
             'sigma_eff': sigma_eff, 'V_pl': V_pl
         }
 
-    def run(self, years: float = 1000) -> List[Earthquake]:
+    def run(self, years: float = 1000, animate: bool = False) -> List[Earthquake]:
         """Run the simulation"""
         if self.equations is None:
             self.setup()
 
+        self.animate_earthquakes = animate
         t_end = years * 365.25 * 24 * 3600
 
         # Create derivative function
@@ -188,9 +195,19 @@ class RealisticSimulation:
                 self._sim_state['eq_start_time'] = t
                 self._sim_state['eq_cells'] = set(eq_cells_now)
                 self._sim_state['eq_slip_start'] = self._sim_state['slip_cumulative'].copy()
+
+                if self.animate_earthquakes:
+                    self._anim_slip_history = [self._sim_state['slip_cumulative'].copy()]
+                    self._anim_time_history = [t / (365.25 * 24 * 3600)]
             else:
                 # 地震継続中
                 self._sim_state['eq_cells'].update(eq_cells_now)
+
+                if self.animate_earthquakes:
+                    # サンプリングレートを下げる（例えば10ステップに1回）
+                    self._anim_slip_history.append(self._sim_state['slip_cumulative'].copy())
+                    self._anim_time_history.append(t / (365.25 * 24 * 3600))
+
         elif self._sim_state['in_earthquake']:
             # 地震終了
             self._sim_state['in_earthquake'] = False
@@ -221,7 +238,6 @@ class RealisticSimulation:
 
             t_years_now = self._sim_state['eq_start_time'] / (365.25 * 24 * 3600)
 
-            # セグメント名を取得（もしsegments_infoがあれば）
             segs_str = ', '.join([
                 self.segments_info.get(s, {}).get('name', s)
                 if isinstance(self.segments_info.get(s), dict) else str(s)
@@ -231,6 +247,19 @@ class RealisticSimulation:
             print(f"  地震 #{eq.id}: t = {t_years_now:.1f} 年, "
                   f"Mw = {Mw:.1f}, 領域 = {segs_str}")
 
+            # アニメーション保存
+            if self.animate_earthquakes:
+                save_path = f'results/earthquakes/eq_{eq.id:03d}.gif'
+                create_slip_animation(
+                    self.cells,
+                    self._anim_slip_history,
+                    self._anim_time_history,
+                    eq.id,
+                    save_path=save_path
+                )
+                self._anim_slip_history = []
+                self._anim_time_history = []
+
             # 外部コールバック呼び出し
             if self.on_earthquake:
                 self.on_earthquake(eq)
@@ -238,9 +267,6 @@ class RealisticSimulation:
         # 進捗表示
         current_time = time.time()
         if current_time - self._sim_state['last_print'] > 5.0:
-            t_end = self.solver.dt_max * 1000 # Dummy if not available, but should be available from context?
-            # Actually run() has t_end.
-            # Just print simple progress
             t_y = t / (365.25 * 24 * 3600)
             V_max = np.max(V)
             print(f"  t = {t_y:.1f} 年, 地震数 = {self._sim_state['n_earthquakes']}, "
