@@ -166,7 +166,7 @@ class StressKernel:
 # Numba JIT 最適化された計算関数
 # ==============================================================================
 
-@njit(parallel=False, cache=True)
+@njit(parallel=True, cache=True)
 def _compute_kernel_matrix(centers: np.ndarray,
                             areas: np.ndarray,
                             normals: np.ndarray,
@@ -263,7 +263,7 @@ def okada_stress(x: float, y: float, z: float,
     return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
 
-@njit(parallel=False, cache=True, fastmath=True)
+@njit(parallel=True, cache=True, fastmath=True)
 def apply_kernel_parallel(K: np.ndarray, slip: np.ndarray) -> np.ndarray:
     """
     カーネル行列の適用（並列化）
