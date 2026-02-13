@@ -33,7 +33,7 @@ os.makedirs('results/earthquakes', exist_ok=True)
 # ==============================================================================
 # シミュレーション
 # ==============================================================================
-def run_simulation(cells: List[Cell], t_years: float = 1000) -> List[Earthquake]:
+def run_simulation(cells: List[Cell], t_years: float = 1000, animate: bool = False) -> List[Earthquake]:
     """シミュレーション実行 (Using RealisticSimulation class)"""
 
     # シミュレーションクラスのインスタンス化
@@ -51,7 +51,8 @@ def run_simulation(cells: List[Cell], t_years: float = 1000) -> List[Earthquake]
     sim.on_earthquake = on_earthquake
 
     # 実行
-    earthquakes = sim.run(years=t_years)
+    sim.animate_earthquakes = animate
+    earthquakes = sim.run(years=t_years, animate=animate)
 
     return earthquakes
 
@@ -112,6 +113,7 @@ if __name__ == '__main__':
     parser.add_argument('--ny', type=int, default=8, help='ディップ方向セル数')
     parser.add_argument('--polygon-data', type=str, default=None,
                         help='polygon_data.json のパス（指定するとポリゴンデータからメッシュ生成）')
+    parser.add_argument('--animate', action='store_true', help='地震発生時のアニメーション（GIF）を作成')
     args = parser.parse_args()
 
     print("=" * 60)
@@ -142,7 +144,7 @@ if __name__ == '__main__':
     plot_plate_geometry(cells, 'results/plate_geometry.png')
 
     # シミュレーション実行
-    earthquakes = run_simulation(cells, t_years=args.years)
+    earthquakes = run_simulation(cells, t_years=args.years, animate=args.animate)
 
     # 年表作成
     if earthquakes:
