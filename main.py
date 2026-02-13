@@ -53,6 +53,8 @@ def parse_args():
                         help='可視化をスキップ')
     parser.add_argument('--gpu', action='store_true',
                         help='GPU (CuPy) を使用')
+    parser.add_argument('--friction-csv', type=str, default=None,
+                        help='摩擦パラメータCSVファイルのパス')
     return parser.parse_args()
 
 
@@ -107,9 +109,12 @@ def run_simulation(config: SimulationConfig):
     print("-" * 50)
     print("Step 2: 摩擦パラメータ設定")
     print("-" * 50)
-    
-    param_setter = FrictionParameterSetter()
-    param_setter.set_parameters(mesh, coords)
+    # 3. 摩擦パラメータの設定
+    # config からパラメータCSVパスを渡す
+    param_setter = FrictionParameterSetter(
+        parameter_csv=config.geometry.friction_csv_path
+    )
+    param_setter.set_parameters(mesh, coords) # Changed coords_system to coords to match existing variable name
     print()
     
     # =========================================================================
@@ -169,7 +174,8 @@ def run_simulation(config: SimulationConfig):
         ),
         kernel=kernel,
         G=config.physical.G,
-        beta=config.physical.beta
+        beta=config.physical.beta,
+        use_gpu=config.solver.use_gpu
     )
     
     # 初期条件
@@ -233,8 +239,12 @@ def run_simulation(config: SimulationConfig):
     last_output_t = [0.0]
     V_history = []
     slip_history = []
+    step_count = [0]
+    
+    viz = Visualizer(output_dir=config.output_dir)
     
     def callback(t, state, dt):
+        step_count[0] += 1
         nonlocal slip
         tau = state[:n_cells]
         theta = state[n_cells:]
@@ -250,6 +260,12 @@ def run_simulation(config: SimulationConfig):
         if event:
             print(f"    *** 地震検出: ID={event.id}, Mw={event.Mw:.1f}, "
                   f"t={t/SECONDS_PER_YEAR:.1f} years ***")
+            # 破壊分布を即座にプロット
+            viz.plot_event_rupture(mesh, event)
+
+        # デバッグ: 状態表示（定期的に）
+        if step_count[0] % 500 == 0:
+             print(f"    t={t/SECONDS_PER_YEAR:.4f}y, dt={dt:.1e}s, V_max={V.max():.2e} m/s")
         
         # 履歴保存（間引き）
         if t - last_output_t[0] >= output_interval:
@@ -364,6 +380,8 @@ def main():
         config.solver.use_gpu = True
     if args.no_viz:
         config.save_full_history = True  # 可視化をスキップするためのフラグ
+    if args.friction_csv:
+        config.geometry.friction_csv_path = args.friction_csv
     
     # 実行
     run_simulation(config)

@@ -52,7 +52,7 @@ class GeometryParameters:
     depth_seismogenic: float = 30.0  # 地震発生層下限 [km]
     
     # メッシュ解像度
-    cell_size: float = 10.0      # セルサイズ [km] (論文では~5km、高速化のため10km)
+    cell_size: float = 7.5      # セルサイズ [km] (科学的な高解像度設定)
     
     # プレート収束方向 (N60°W = 330°)
     convergence_direction: float = 330.0  # [degrees from N]
@@ -60,6 +60,9 @@ class GeometryParameters:
     # プレート収束速度 [m/year]
     V_pl_west: float = 0.055     # 西部 (5.5 cm/y)
     V_pl_east: float = 0.010     # 東端 (1.0 cm/y)
+    
+    # パラメータCSV（オプション）
+    friction_csv_path: Optional[str] = None
 
 
 @dataclass
@@ -82,7 +85,7 @@ class SolverParameters:
     output_interval_years: float = 1.0
     
     # 並列化設定
-    use_parallel: bool = True
+    use_parallel: bool = False
     use_gpu: bool = False           # GPU (CuPy) を使用するか
     n_threads: int = -1             # -1 = 自動検出
 
@@ -188,6 +191,7 @@ class SimulationConfig:
         config.geometry.cell_size = 20.0
         config.solver.t_years = 500.0
         config.solver.rtol = 1.0e-4
+        config.solver.use_parallel = False # Ensure false here too
         return config
 
 

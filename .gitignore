@@ -79,3 +79,11 @@ results/
 # HTML files downloaded
 *.html
 *_files/
+
+# Project specific exclusions
+*.log
+*.zip
+*_log.txt
+polygon_data - コピー.json
+img_*.avif
+results_*/

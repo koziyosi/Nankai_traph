@@ -34,11 +34,27 @@ class QuasiDynamicEquations:
     beta: float = 3750.0    # S波速度 [m/s]
     eta: float = 1.0        # 準動的補正係数
     
+    # GPU設定
+    use_gpu: bool = False
+    _velocity_kernel = None
+    _evolution_kernel = None
+    
     def __post_init__(self):
         self.kernel.G = self.G
         self.kernel.beta = self.beta
         self.kernel.eta = self.eta
-    
+        
+        if self.use_gpu:
+            try:
+                import cupy as cp
+                from .cupy_kernels import get_velocity_solver_kernel, get_state_evolution_kernel
+                self._velocity_kernel = get_velocity_solver_kernel()
+                self._evolution_kernel = get_state_evolution_kernel()
+                print("GPU Kernels loaded successfully.")
+            except ImportError as e:
+                print(f"CuPy not found or kernel init failed: {e}. Fallback to CPU.")
+                self.use_gpu = False
+
     def compute_derivatives(self,
                             t: float,
                             state: np.ndarray,
@@ -51,43 +67,72 @@ class QuasiDynamicEquations:
                             ) -> np.ndarray:
         """
         状態変数の時間微分を計算
-        
-        state = [tau_1, ..., tau_n, theta_1, ..., theta_n]
-        
-        Parameters:
-            t: 時間 [s]
-            state: 状態ベクトル [2*n_cells]
-            n_cells: セル数
-            a, b, L: 摩擦パラメータ
-            sigma_eff: 有効法線応力 [Pa]
-            V_pl: プレート収束速度 [m/s]
-        
-        Returns:
-            d_state_dt: 時間微分 [2*n_cells]
         """
+        if self.use_gpu and self._velocity_kernel is not None:
+            return self._compute_derivatives_gpu(
+                t, state, n_cells, a, b, L, sigma_eff, V_pl
+            )
+        
         # 状態変数を分解
         tau = state[:n_cells]      # 剪断応力
         theta = state[n_cells:]    # 状態変数
         
-        # すべり速度を求める（準動的平衡から）
+        # すべり速度を求める（準動的平衡から） (CPU)
         V = self._solve_velocity(tau, theta, a, b, L, sigma_eff)
         
-        # 応力の時間微分
-        # dτ/dt = Σ_j K_ij * (V_pl_j - V_j) - η*G/β * dV/dt
-        # 準動的近似では dV/dt の項を簡略化
+        # 応力の時間微分 (CPU)
         dtau_dt = _compute_stress_rate(
             self.kernel.K, V, V_pl, self.G, self.beta, self.eta
         )
         
-        # 状態変数の時間微分
+        # 状態変数の時間微分 (CPU)
         dtheta_dt = compute_state_evolution_parallel(
             V, theta, L, self.friction.V_c
         )
         
-        # 結合
-        d_state_dt = np.concatenate([dtau_dt, dtheta_dt])
+        return np.concatenate([dtau_dt, dtheta_dt])
+
+    def _compute_derivatives_gpu(self, t, state, n_cells, a, b, L, sigma_eff, V_pl):
+        """GPUを使用した一括計算"""
+        import cupy as cp
         
-        return d_state_dt
+        # 配列をGPUへ転送 (オーバーヘッドはあるが、行列演算で取り返す)
+        tau_gpu = cp.asarray(state[:n_cells])
+        theta_gpu = cp.asarray(state[n_cells:])
+        
+        a_gpu = cp.asarray(a)
+        b_gpu = cp.asarray(b)
+        L_gpu = cp.asarray(L)
+        sigma_eff_gpu = cp.asarray(sigma_eff)
+        V_pl_gpu = cp.asarray(V_pl)
+        
+        # カーネル行列 (K) をGPUへ
+        if not hasattr(self.kernel, '_K_gpu'):
+             print("Transferring Kernel matrix to GPU...")
+             self.kernel._K_gpu = cp.asarray(self.kernel.K)
+             print("Kernel transfer complete.")
+        K_gpu = self.kernel._K_gpu
+        
+        # 1. 速度計算 (Newton) - Elementwise Kernel
+        V_gpu = self._velocity_kernel(
+            tau_gpu, theta_gpu, a_gpu, b_gpu, L_gpu, sigma_eff_gpu,
+            self.G, self.beta, self.eta,
+            self.friction.mu_0, self.friction.V_0, self.friction.V_c
+        )
+        
+        # 2. 応力変化率 dtau/dt = K @ (V - V_pl)
+        dV_gpu = V_gpu - V_pl_gpu
+        dtau_dt_gpu = cp.dot(K_gpu, dV_gpu)
+        
+        # 3. 状態変数変化率
+        dtheta_dt_gpu = self._evolution_kernel(
+            V_gpu, theta_gpu, L_gpu, self.friction.V_c
+        )
+        
+        # 結果結合
+        result_gpu = cp.concatenate([dtau_dt_gpu, dtheta_dt_gpu])
+        
+        return cp.asnumpy(result_gpu)
     
     def _solve_velocity(self,
                         tau: np.ndarray,
@@ -96,15 +141,7 @@ class QuasiDynamicEquations:
                         b: np.ndarray,
                         L: np.ndarray,
                         sigma_eff: np.ndarray) -> np.ndarray:
-        """
-        準動的平衡から すべり速度を求める
-        
-        τ_s = τ_f + η*G/β * V
-        
-        τ_f = σ_eff * [μ_0 + a*ln(V/V_0+1) + b*ln(V_0*Θ/L+1)]
-        
-        これは V に関する非線形方程式なので Newton法で解く
-        """
+        """準動的平衡からすべり速度を求める (CPU版)"""
         return _solve_velocity_newton(
             tau, theta, a, b, L, sigma_eff,
             self.G, self.beta, self.eta,
@@ -119,6 +156,14 @@ class QuasiDynamicEquations:
                           L: np.ndarray,
                           sigma_eff: np.ndarray) -> np.ndarray:
         """すべり速度を取得（外部アクセス用）"""
+        if self.use_gpu and self._velocity_kernel is not None:
+             import cupy as cp
+             # GPU版
+             return cp.asnumpy(self._velocity_kernel(
+                cp.asarray(tau), cp.asarray(theta), cp.asarray(a), cp.asarray(b), cp.asarray(L), cp.asarray(sigma_eff),
+                self.G, self.beta, self.eta,
+                self.friction.mu_0, self.friction.V_0, self.friction.V_c
+             ))
         return self._solve_velocity(tau, theta, a, b, L, sigma_eff)
     
     def initialize_state(self,
@@ -129,22 +174,7 @@ class QuasiDynamicEquations:
                          L: np.ndarray,
                          V_init: float = 3.17e-10  # 0.01 m/year
                          ) -> np.ndarray:
-        """
-        初期状態を設定
-        
-        論文では V(0) = 0.1 cm/year = 3.17e-11 m/s
-        ここでは V(0) = 0.01 m/year = 3.17e-10 m/s を使用
-        
-        Parameters:
-            n_cells: セル数
-            sigma_eff: 有効法線応力
-            a, b: 摩擦パラメータ
-            L: 特徴的すべり量
-            V_init: 初期すべり速度 [m/s]
-        
-        Returns:
-            state: 初期状態 [2*n_cells]
-        """
+        """初期状態を設定"""
         V = np.full(n_cells, V_init)
         
         # 定常状態の Θ
@@ -174,17 +204,13 @@ def _compute_stress_rate(K: np.ndarray,
                           beta: float,
                           eta: float) -> np.ndarray:
     """
-    応力の時間微分を計算
-    
-    dτ/dt = Σ_j K_ij * (V_pl_j - V_j)
-    
-    準動的近似では放射減衰項は速度に含まれる
+    応力の時間微分を計算 (CPU)
     """
     n = len(V)
     dtau_dt = np.zeros(n)
     
-    # 相対速度
-    dV = V_pl - V
+    # 相対速度 (dV = V - V_pl)
+    dV = V - V_pl
     
     # K @ dV
     for i in range(n):
@@ -212,50 +238,39 @@ def _solve_velocity_newton(tau: np.ndarray,
                             max_iter: int = 50,
                             tol: float = 1.0e-10) -> np.ndarray:
     """
-    Newton法で すべり速度を求める
-    
-    F(V) = τ - σ_eff * μ(V, Θ) - η*G/β * V = 0
+    Newton法で すべり速度を求める (CPU)
     """
     n = len(tau)
     V = np.empty(n)
     
-    # 放射減衰係数
     rad_coef = eta * G / beta
     
     for i in range(n):
-        # 初期推定（線形近似）
-        V_guess = V_0  # 参照速度から開始
-        
+        V_guess = V_0
         theta_i = max(theta[i], 1.0e-20)
         
         for iteration in range(max_iter):
             V_safe = max(V_guess, 1.0e-20)
             
-            # F(V) の計算
             term1 = a[i] * np.log(V_safe / V_0 + 1.0)
             term2 = b[i] * np.log(V_0 * theta_i / L[i] + 1.0)
             mu_v = mu_0 + term1 + term2
             
             F = tau[i] - sigma_eff[i] * mu_v - rad_coef * V_safe
             
-            # F'(V) の計算
             dmu_dV = a[i] / (V_safe + V_0)
             dF_dV = -sigma_eff[i] * dmu_dV - rad_coef
             
-            # Newton更新
             if abs(dF_dV) < 1.0e-30:
                 break
             
             dV = -F / dF_dV
-            
-            # ステップ制限
             V_new = V_guess + dV
             if V_new < 1.0e-20:
                 V_new = V_guess * 0.1
-            elif V_new > 1.0e3:  # 1 km/s を上限
+            elif V_new > 1.0e3:
                 V_new = 1.0e3
             
-            # 収束判定
             if abs(dV) < tol * abs(V_guess) + tol:
                 V_guess = V_new
                 break
@@ -267,94 +282,6 @@ def _solve_velocity_newton(tau: np.ndarray,
     return V
 
 
-@njit(parallel=True, cache=True, fastmath=True)
-def compute_derivatives_parallel(K: np.ndarray,
-                                  tau: np.ndarray,
-                                  theta: np.ndarray,
-                                  a: np.ndarray,
-                                  b: np.ndarray,
-                                  L: np.ndarray,
-                                  sigma_eff: np.ndarray,
-                                  V_pl: np.ndarray,
-                                  G: float,
-                                  beta: float,
-                                  eta: float,
-                                  mu_0: float,
-                                  V_0: float,
-                                  V_c: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    状態変数の時間微分を並列計算
-    
-    Returns:
-        V: すべり速度 [n_cells]
-        dtau_dt: 応力変化率 [n_cells]
-        dtheta_dt: 状態変数変化率 [n_cells]
-    """
-    n = len(tau)
-    V = np.empty(n)
-    dtau_dt = np.zeros(n)
-    dtheta_dt = np.empty(n)
-    
-    rad_coef = eta * G / beta
-    
-    # まず速度を計算（Newton法、並列化可能）
-    for i in prange(n):
-        V_guess = V_0
-        theta_i = max(theta[i], 1.0e-20)
-        
-        for _ in range(50):
-            V_safe = max(V_guess, 1.0e-20)
-            
-            term1 = a[i] * np.log(V_safe / V_0 + 1.0)
-            term2 = b[i] * np.log(V_0 * theta_i / L[i] + 1.0)
-            mu_v = mu_0 + term1 + term2
-            
-            F = tau[i] - sigma_eff[i] * mu_v - rad_coef * V_safe
-            dmu_dV = a[i] / (V_safe + V_0)
-            dF_dV = -sigma_eff[i] * dmu_dV - rad_coef
-            
-            if abs(dF_dV) < 1.0e-30:
-                break
-            
-            dV = -F / dF_dV
-            V_new = V_guess + dV
-            V_new = max(min(V_new, 1.0e3), 1.0e-20)
-            
-            if abs(dV) < 1.0e-10 * abs(V_guess) + 1.0e-10:
-                V_guess = V_new
-                break
-            V_guess = V_new
-        
-        V[i] = max(V_guess, 1.0e-20)
-    
-    # 応力変化率を計算
-    for i in prange(n):
-        s = 0.0
-        for j in range(n):
-            s += K[i, j] * (V_pl[j] - V[j])
-        dtau_dt[i] = s
-    
-    # 状態変数変化率を計算
-    for i in prange(n):
-        V_i = max(V[i], 1.0e-20)
-        theta_i = max(theta[i], 1.0e-20)
-        x = V_i * theta_i / L[i]
-        
-        if x < 700:
-            term1 = np.exp(-x)
-        else:
-            term1 = 0.0
-        
-        if V_c / V_i < 700:
-            term2 = x * np.exp(-V_c / V_i)
-        else:
-            term2 = 0.0
-        
-        dtheta_dt[i] = term1 - term2
-    
-    return V, dtau_dt, dtheta_dt
-
-
 def create_derivative_function(equations: QuasiDynamicEquations,
                                n_cells: int,
                                a: np.ndarray,
@@ -364,27 +291,11 @@ def create_derivative_function(equations: QuasiDynamicEquations,
                                V_pl: np.ndarray) -> Callable:
     """
     ODEソルバー用の微分関数を作成
-    
-    Returns:
-        f(t, state) -> d_state_dt
     """
-    K = equations.kernel.K
-    G = equations.G
-    beta = equations.beta
-    eta = equations.eta
-    mu_0 = equations.friction.mu_0
-    V_0 = equations.friction.V_0
-    V_c = equations.friction.V_c
     
     def derivative(t: float, state: np.ndarray) -> np.ndarray:
-        tau = state[:n_cells]
-        theta = state[n_cells:]
-        
-        V, dtau_dt, dtheta_dt = compute_derivatives_parallel(
-            K, tau, theta, a, b, L, sigma_eff, V_pl,
-            G, beta, eta, mu_0, V_0, V_c
+        return equations.compute_derivatives(
+            t, state, n_cells, a, b, L, sigma_eff, V_pl
         )
-        
-        return np.concatenate([dtau_dt, dtheta_dt])
     
     return derivative

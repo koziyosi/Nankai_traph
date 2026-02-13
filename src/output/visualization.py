@@ -74,13 +74,15 @@ class Visualizer:
         
         if show_coastline:
             self._add_coastline(ax)
+            self._add_trough_axis(ax)
         
         ax.set_xlim(self.lon_range)
         ax.set_ylim(self.lat_range)
         ax.set_xlabel('Longitude [°E]')
         ax.set_ylabel('Latitude [°N]')
-        ax.set_title(title)
+        ax.set_title(title, pad=15, fontsize=14, fontweight='bold')
         ax.set_aspect('equal')
+        ax.grid(True, linestyle='--', alpha=0.3)
         
         if save_name:
             filepath = os.path.join(self.output_dir, save_name)
@@ -102,6 +104,23 @@ class Visualizer:
             title=title,
             cmap='hot_r',
             clabel='Slip [m]',
+            save_name=save_name
+        )
+    
+    def plot_event_rupture(self,
+                           mesh,
+                           event,
+                           save_name: str = None):
+        """特定の地震イベントの破壊（すべり）分布を表示"""
+        if save_name is None:
+            save_name = f"event_{event.id:03d}_rupture.png"
+            
+        return self.plot_mesh(
+            mesh,
+            values=event.slip_distribution,
+            title=f"Event {event.id} Rupture (Mw {event.Mw:.1f}) at t={event.t_start/3.15576e7:.1f}y",
+            cmap='hot_r',
+            clabel='Event Slip [m]',
             save_name=save_name
         )
     
@@ -333,22 +352,31 @@ class Visualizer:
         return anim
     
     def _add_coastline(self, ax):
-        """簡易海岸線を追加"""
-        # 日本の本州・四国・九州の概略海岸線
-        # （簡易版、詳細は cartopy や geopandas を使用）
-        coastline = np.array([
+        """詳細な海岸線を追加"""
+        # 九州・四国・本州の海岸線データ（主要な屈曲点）
+        coasts = [
+            # 九州東岸
+            [(131.0, 31.2), (131.5, 32.0), (131.8, 33.0), (131.0, 33.8)],
+            # 四国南岸
+            [(132.2, 32.8), (132.8, 32.8), (133.5, 33.3), (134.5, 33.8), (134.8, 34.2)],
             # 紀伊半島
-            [135.0, 33.5], [136.0, 34.0], [136.5, 34.5], [137.0, 34.7],
-            [138.0, 34.8], [139.0, 35.0], [139.5, 35.2],
-            # 四国
-            [132.5, 33.0], [133.0, 33.5], [133.5, 33.8], [134.0, 34.0],
-            [134.5, 34.2], [135.0, 34.3],
-            # 九州
-            [131.0, 31.5], [131.5, 32.0], [132.0, 32.5], [132.5, 33.0],
-        ])
+            [(135.1, 34.2), (135.8, 33.4), (136.0, 33.6), (136.8, 34.4), (137.0, 34.8)],
+            # 東海・伊豆
+            [(137.2, 34.8), (138.5, 34.7), (138.8, 35.1), (139.2, 34.6), (139.8, 35.3)]
+        ]
         
-        # 点として表示
-        ax.plot(coastline[:, 0], coastline[:, 1], 'k.', markersize=2, alpha=0.3)
+        for coast in coasts:
+            lons, lats = zip(*coast)
+            ax.plot(lons, lats, color='#444444', linewidth=1.5, alpha=0.9, zorder=10)
+            
+    def _add_trough_axis(self, ax):
+        """南海トラフ軸を追加"""
+        trough = [
+            (131.0, 30.5), (132.0, 31.0), (133.5, 31.8), 
+            (135.0, 32.5), (137.0, 33.5), (138.5, 34.2), (139.5, 34.8)
+        ]
+        lons, lats = zip(*trough)
+        ax.plot(lons, lats, color='blue', linestyle='--', linewidth=1.2, alpha=0.6, label='Trough Axis', zorder=5)
     
     def save_summary_plots(self, 
                            mesh,

@@ -96,12 +96,6 @@ class ParallelAccelerator:
                        chunk_size: int = None) -> np.ndarray:
         """
         関数を並列適用
-        
-        Parameters:
-            func: 適用する関数
-            data: 入力データ
-            *args: 追加引数
-            chunk_size: チャンクサイズ
         """
         if self.use_gpu and HAS_CUPY:
             # GPU版
@@ -138,8 +132,6 @@ def gpu_solve_velocity(tau: np.ndarray,
                        params: dict) -> np.ndarray:
     """
     GPU上でのNewton法による速度計算
-    
-    TODO: CuPy kernel として実装
     """
     # プレースホルダー - CPU版にフォールバック
     from ..physics.equations import _solve_velocity_newton
@@ -257,21 +249,24 @@ def benchmark_matmul(n: int = 1000, iterations: int = 100) -> dict:
     
     # CuPy版
     if HAS_CUPY:
-        A_gpu = cp.asarray(A)
-        x_gpu = cp.asarray(x)
-        
-        # ウォームアップ
-        _ = cp.dot(A_gpu, x_gpu)
-        cp.cuda.Stream.null.synchronize()
-        
-        start = time.time()
-        for _ in range(iterations):
+        try:
+            A_gpu = cp.asarray(A)
+            x_gpu = cp.asarray(x)
+            
+            # ウォームアップ
             _ = cp.dot(A_gpu, x_gpu)
-        cp.cuda.Stream.null.synchronize()
-        cupy_time = (time.time() - start) / iterations
-        
-        result['cupy'] = cupy_time
-        result['speedup'] = numpy_time / cupy_time
+            cp.cuda.Stream.null.synchronize()
+            
+            start = time.time()
+            for _ in range(iterations):
+                _ = cp.dot(A_gpu, x_gpu)
+            cp.cuda.Stream.null.synchronize()
+            cupy_time = (time.time() - start) / iterations
+            
+            result['cupy'] = cupy_time
+            result['speedup'] = numpy_time / cupy_time
+        except Exception as e:
+            result['cupy_error'] = str(e)
     
     return result
 
@@ -289,7 +284,9 @@ def get_system_info() -> dict:
             device = cp.cuda.Device(0)
             info['gpu_name'] = device.name
             info['gpu_memory'] = device.mem_info[1] / 1e9  # GB
-        except:
-            pass
+        except Exception as e:
+            # エラーをキャッチしてクラッシュを防ぐ
+            info['gpu_error'] = f"Failed to access Device(0): {e}"
+            info['has_cupy'] = False
     
     return info

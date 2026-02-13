@@ -52,18 +52,6 @@ class RK45Solver:
               verbose: bool = True) -> dict:
         """
         常微分方程式を解く
-        
-        Parameters:
-            f: 微分関数 f(t, y) -> dy/dt
-            y0: 初期条件
-            t_span: (t_start, t_end)
-            t_eval: 出力を記録する時刻（None の場合は全ステップ）
-            callback: ステップごとに呼ばれる関数 callback(t, y, dt)
-            max_steps: 最大ステップ数
-            verbose: 進捗表示
-        
-        Returns:
-            dict with 't', 'y', 'n_steps', etc.
         """
         t0, t_end = t_span
         t = t0
@@ -84,72 +72,80 @@ class RK45Solver:
         # t_eval用のインデックス
         eval_idx = 0 if t_eval is not None else None
         
-        while t < t_end and self.n_steps < max_steps:
-            # ステップサイズを終端に合わせる
-            if t + dt > t_end:
-                dt = t_end - t
-            
-            # RK45ステップ
-            y_new, error, k = self._rk45_step(f, t, y, dt)
-            
-            # 誤差評価
-            scale = self.atol + self.rtol * np.maximum(np.abs(y), np.abs(y_new))
-            err_ratio = np.max(np.abs(error) / scale)
-            
-            if err_ratio <= 1.0:
-                # ステップ受理
-                self.n_accept += 1
-                t_new = t + dt
+        try:
+            while t < t_end and self.n_steps < max_steps:
+                # ステップサイズを終端に合わせる
+                if t + dt > t_end:
+                    dt = t_end - t
                 
-                # 補間して t_eval の値を記録
-                if t_eval is not None:
-                    while eval_idx < len(t_eval) and t_eval[eval_idx] <= t_new:
-                        if t_eval[eval_idx] >= t:
-                            # Hermite補間
-                            theta = (t_eval[eval_idx] - t) / dt
-                            y_interp = self._hermite_interpolate(y, y_new, k[0], k[-1], dt, theta)
-                            t_history.append(t_eval[eval_idx])
-                            y_history.append(y_interp)
-                        eval_idx += 1
+                # RK45ステップ
+                y_new, error, k = self._rk45_step(f, t, y, dt)
+                
+                # 誤差評価
+                scale = self.atol + self.rtol * np.maximum(np.abs(y), np.abs(y_new))
+                err_ratio = np.max(np.abs(error) / scale)
+                
+                if err_ratio <= 1.0:
+                    # ステップ受理
+                    self.n_accept += 1
+                    t_new = t + dt
+                    
+                    # 補間して t_eval の値を記録
+                    if t_eval is not None:
+                        while eval_idx < len(t_eval) and t_eval[eval_idx] <= t_new:
+                            if t_eval[eval_idx] >= t:
+                                # Hermite補間
+                                theta = (t_eval[eval_idx] - t) / dt
+                                y_interp = self._hermite_interpolate(y, y_new, k[0], k[-1], dt, theta)
+                                t_history.append(t_eval[eval_idx])
+                                y_history.append(y_interp)
+                            eval_idx += 1
+                    else:
+                        t_history.append(t_new)
+                        y_history.append(y_new.copy())
+                    
+                    t = t_new
+                    y = y_new
+                    
+                    # コールバック
+                    if callback is not None:
+                        callback(t, y, dt)
+                    
+                    # dt増加
+                    if err_ratio > 0:
+                        scale_factor = self.safety * err_ratio ** self.p_grow
+                        scale_factor = min(scale_factor, self.max_scale)
+                        dt = dt * scale_factor
+                    else:
+                        dt = dt * self.max_scale
                 else:
-                    t_history.append(t_new)
-                    y_history.append(y_new.copy())
-                
-                t = t_new
-                y = y_new
-                
-                # コールバック
-                if callback is not None:
-                    callback(t, y, dt)
-                
-                # dt増加
-                if err_ratio > 0:
-                    scale_factor = self.safety * err_ratio ** self.p_grow
-                    scale_factor = min(scale_factor, self.max_scale)
+                    # ステップ棄却
+                    self.n_reject += 1
+                    scale_factor = max(self.safety * err_ratio ** self.p_shrink, self.min_scale)
                     dt = dt * scale_factor
-                else:
-                    dt = dt * self.max_scale
-            else:
-                # ステップ棄却
-                self.n_reject += 1
-                scale_factor = max(self.safety * err_ratio ** self.p_shrink, self.min_scale)
-                dt = dt * scale_factor
-            
-            # ステップサイズ制限
-            dt = max(self.dt_min, min(dt, self.dt_max))
-            
-            self.n_steps += 1
-            
-            # 進捗表示
-            if verbose and time.time() - last_print > 5.0:
-                progress = (t - t0) / (t_end - t0) * 100
-                elapsed = time.time() - start_time
-                print(f"  t = {t/3.15576e7:.2f} years, "
-                      f"dt = {dt:.2e} s, "
-                      f"progress = {progress:.1f}%, "
-                      f"steps = {self.n_steps}, "
-                      f"elapsed = {elapsed:.1f} s")
-                last_print = time.time()
+                
+                # ステップサイズ制限
+                dt = max(self.dt_min, min(dt, self.dt_max))
+                
+                self.n_steps += 1
+                
+                # 進捗表示
+                if verbose and time.time() - last_print > 5.0:
+                    progress = (t - t0) / (t_end - t0) * 100
+                    elapsed = time.time() - start_time
+                    print(f"  t = {t/3.15576e7:.2f} years, "
+                          f"dt = {dt:.2e} s, "
+                          f"progress = {progress:.1f}%, "
+                          f"steps = {self.n_steps}, "
+                          f"elapsed = {elapsed:.1f} s")
+                    last_print = time.time()
+
+        except KeyboardInterrupt:
+            print("\nシミュレーションが中断されました (KeyboardInterrupt)")
+        except Exception as e:
+            print(f"\nシミュレーションエラー: {e}")
+            import traceback
+            traceback.print_exc()
         
         elapsed = time.time() - start_time
         
@@ -220,55 +216,7 @@ class RK45Solver:
 # ==============================================================================
 # Numba最適化された RK45 ステップ（コア計算用）
 # ==============================================================================
-
-@njit(cache=True, fastmath=True)
-def rk45_step_numba(f_values: np.ndarray,
-                    y: np.ndarray,
-                    dt: float) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    事前計算されたf値を使用したRK45ステップ
-    
-    f_values: [7, n] - k1からk7の値
-    """
-    # Butcher係数
-    b1, b3, b4, b5, b6 = 35/384, 500/1113, 125/192, -2187/6784, 11/84
-    b1s, b3s, b4s, b5s, b6s, b7s = 5179/57600, 7571/16695, 393/640, -92097/339200, 187/2100, 1/40
-    
-    k1 = f_values[0]
-    k3 = f_values[2]
-    k4 = f_values[3]
-    k5 = f_values[4]
-    k6 = f_values[5]
-    k7 = f_values[6]
-    
-    # 5次の解
-    y_new = y + dt * (b1*k1 + b3*k3 + b4*k4 + b5*k5 + b6*k6)
-    
-    # 誤差
-    error = dt * ((b1-b1s)*k1 + (b3-b3s)*k3 + (b4-b4s)*k4 + 
-                  (b5-b5s)*k5 + (b6-b6s)*k6 - b7s*k7)
-    
-    return y_new, error
-
-
-@njit(cache=True)
-def compute_error_ratio(error: np.ndarray,
-                        y: np.ndarray,
-                        y_new: np.ndarray,
-                        atol: float,
-                        rtol: float) -> float:
-    """誤差比の計算"""
-    n = len(error)
-    max_ratio = 0.0
-    
-    for i in range(n):
-        scale = atol + rtol * max(abs(y[i]), abs(y_new[i]))
-        ratio = abs(error[i]) / scale
-        if ratio > max_ratio:
-            max_ratio = ratio
-    
-    return max_ratio
-
+# (Note: rk45_step_numba removed to keep file simple and as it was unused in main class)
 
 def create_fast_solver(rtol: float = 1.0e-6,
                        atol: float = 1.0e-9) -> RK45Solver:
